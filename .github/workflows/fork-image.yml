@@ -1,0 +1,142 @@
+# Builds ghcr.io/fraxalotl/listenarr from upstream Listenarr canary + the local
+# patches on this branch. Runs on push to this branch, daily, and on demand.
+#
+# Each run merges the latest upstream canary into a throwaway working copy (it
+# never pushes), so upstream updates are picked up automatically. If upstream
+# conflicts with a local patch the run fails, and the patch needs rebasing.
+# The image is skipped when one already exists for the same upstream + patch commits.
+name: Fork image (upstream canary + local patches)
+
+on:
+  push:
+    branches: [ fraxalotl ]
+  schedule:
+    - cron: '30 3 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if an image for this upstream+patch combination exists
+        type: boolean
+        default: false
+
+concurrency:
+  group: fork-image
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  UPSTREAM_REPO: https://github.com/Listenarrs/Listenarr.git
+  UPSTREAM_BRANCH: canary
+  IMAGE: ghcr.io/${{ github.repository_owner }}/listenarr
+  API_PROJECT: listenarr.api/Listenarr.Api.csproj
+  DOCKER_OUTPUT: listenarr.api/docker-publish
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout patch branch
+        uses: actions/checkout@v4
+        with:
+          ref: fraxalotl
+          fetch-depth: 0
+
+      - name: Merge latest upstream canary (local only, not pushed)
+        id: merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "fork-image-bot"
+          git config user.email "fork-image-bot@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+          PATCH_SHA=$(git rev-parse --short=7 HEAD)
+          UPSTREAM_SHA=$(git rev-parse --short=7 "upstream/$UPSTREAM_BRANCH")
+          if ! git merge --no-edit "upstream/$UPSTREAM_BRANCH"; then
+            echo "::error::Upstream $UPSTREAM_BRANCH ($UPSTREAM_SHA) conflicts with local patches on fraxalotl ($PATCH_SHA). Rebase the patch branch."
+            git merge --abort || true
+            exit 1
+          fi
+          VERSION=$(sed -n 's:.*<Version>\(.*\)</Version>.*:\1:p' "$API_PROJECT" | head -n1)
+          [ -n "$VERSION" ] || VERSION=$(node -p "require('./fe/package.json').version" 2>/dev/null || echo "0.0.0")
+          echo "patch_sha=$PATCH_SHA" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=${VERSION}-${UPSTREAM_SHA}-p${PATCH_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Upstream $UPSTREAM_BRANCH: $UPSTREAM_SHA, patches: $PATCH_SHA, version: $VERSION"
+          echo "Local patches applied on top of upstream:"
+          git log --oneline "upstream/$UPSTREAM_BRANCH..HEAD" --no-merges
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Skip if this combination is already built
+        id: exists
+        shell: bash
+        run: |
+          if [ "${{ inputs.force }}" != "true" ] && docker manifest inspect "$IMAGE:${{ steps.merge.outputs.tag }}" >/dev/null 2>&1; then
+            echo "Image $IMAGE:${{ steps.merge.outputs.tag }} already exists; nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Node
+        if: steps.exists.outputs.skip != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.node-version'
+
+      - name: Setup .NET
+        if: steps.exists.outputs.skip != 'true'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore and build
+        if: steps.exists.outputs.skip != 'true'
+        run: |
+          dotnet restore listenarr.slnx
+          dotnet build listenarr.slnx -c Release --no-restore
+
+      - name: Publish API for runtime image (amd64)
+        if: steps.exists.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$DOCKER_OUTPUT"
+          dotnet publish "$API_PROJECT" -c Release -r linux-x64 --no-restore --self-contained false /p:UseAppHost=false -o "$DOCKER_OUTPUT/amd64"
+          if [ ! -d "$DOCKER_OUTPUT/amd64/tools/discord-bot" ]; then
+            mkdir -p "$DOCKER_OUTPUT/amd64/tools"
+            cp -r tools/discord-bot "$DOCKER_OUTPUT/amd64/tools/"
+          fi
+          rm -rf "$DOCKER_OUTPUT/amd64/tools/discord-bot/node_modules"
+          test -f "$DOCKER_OUTPUT/amd64/tools/discord-bot/package-lock.json"
+
+      - name: Set up Docker Buildx
+        if: steps.exists.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        if: steps.exists.outputs.skip != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: listenarr.api/Dockerfile.runtime
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:canary
+            ${{ env.IMAGE }}:${{ steps.merge.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.merge.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.merge.outputs.upstream_sha }}
+            org.opencontainers.image.description=Listenarr canary (upstream ${{ steps.merge.outputs.upstream_sha }}) + fraxalotl patches (${{ steps.merge.outputs.patch_sha }})
