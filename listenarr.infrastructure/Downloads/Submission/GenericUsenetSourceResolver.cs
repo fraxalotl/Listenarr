@@ -50,5 +50,7 @@ public sealed class GenericUsenetSourceResolver(
 
     private static string SanitizeFileName(string value)
         => string.Concat(value.Select(character =>
-            Path.GetInvalidFileNameChars().Contains(character) ? '_' : character));
+            Path.GetInvalidFileNameChars().Contains(character) || character is '"' or '\\'
+                ? '_'
+                : character));
 }
